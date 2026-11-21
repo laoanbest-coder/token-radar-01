@@ -1,8 +1,10 @@
-// radar-2: fitted token-launch model over the make.fun token-radar-01 snapshot.
+// radar-3: fitted token-launch model over the make.fun token-radar-01 snapshot.
 // Everything here is a pure function of the snapshot: no clocks, no randomness, no network.
-// The fit: ridge regression of log(market cap / TVL) on traded-token comps, target winsorised
-// to [-6, 3]; the launch value of a pre-token protocol is its TVL times the fitted ratio,
-// and the board ranks by expected value = token odds x fitted FDV.
+// The fit (v3, chosen because it is the only form that survives every out-of-sample test
+// — see METHOD.md): ridge regression of log(market cap / TVL) on log10 TVL alone, λ = 3,
+// over one traded comp per ticker. The launch value of a pre-token protocol is its TVL
+// times the fitted ratio, and the board ranks by expected value = token odds x fitted FDV.
+// A 20-feature ridge is kept only as a benchmark, to show what was tried and dropped.
 
 export interface Protocol {
   slug: string;
@@ -25,8 +27,11 @@ export interface Snapshot {
 }
 
 export const DAY_MS = 86400000;
-export const MODEL_VERSION = 'radar-2';
-export const RIDGE_LAMBDA = 10;
+export const MODEL_VERSION = 'radar-3';
+export const RIDGE_LAMBDA = 3;
+export const FULL_LAMBDA = 10;
+export const BOOTSTRAP_RESAMPLES = 200;
+export const BOOTSTRAP_SEED = 20261121;
 export const TARGET_LO = -6;
 export const TARGET_HI = 3;
 
@@ -65,18 +70,42 @@ const VERSIONED_NAME = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 const WRAPPED_NAME = /\b(wrapped|staked|staking)\b/i;
 
 export function isRankable(p: Protocol): boolean {
-  if (!isPreToken(p)) return false;
-  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
-  if (VERSIONED_NAME.test(p.name)) return false;
-  if (WRAPPED_NAME.test(p.name)) return false;
-  if (EXCHANGE_NAMES.some((e) => p.name.startsWith(e))) return false;
-  return true;
+  return unrankableReason(p) === null;
 }
 
-/** Traded comps for the fit: a positive market cap and positive TVL. One snapshot row
+/** Why a protocol is not ranked. Null means rankable. The checks run in the same
+ *  order as the watchlist's exclusion rule, so the first reason that applies wins. */
+export function unrankableReason(p: Protocol): string | null {
+  if (!isPreToken(p)) return 'live_token';
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return 'excluded_category';
+  if (VERSIONED_NAME.test(p.name)) return 'versioned_name';
+  if (WRAPPED_NAME.test(p.name)) return 'wrapped_or_staked_name';
+  if (EXCHANGE_NAMES.some((e) => p.name.startsWith(e))) return 'exchange_name';
+  return null;
+}
+
+/** Traded comps for the fit: a positive market cap and positive TVL, one row per ticker —
+ *  the snapshot lists the same token twice (beefy and bifi both record BIFI), so the
+ *  smaller-TVL duplicate is dropped and the largest-TVL row is kept. One snapshot row
  *  (autofinance) records a market cap of -1 and is excluded here by the > 0 test. */
 export function tradedComps(s: Snapshot): Protocol[] {
-  return s.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const raw = s.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const bySymbol = new Map<string, Protocol[]>();
+  for (const p of raw) {
+    const k = (p.symbol ?? '').toLowerCase();
+    if (!bySymbol.has(k)) bySymbol.set(k, []);
+    bySymbol.get(k)!.push(p);
+  }
+  const kept = [...bySymbol.values()].map((v) => v.sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1))[0]);
+  const order = new Map(raw.map((p, i) => [p.slug, i]));
+  return kept.sort((a, b) => (order.get(a.slug) ?? 0) - (order.get(b.slug) ?? 0));
+}
+
+/** Slugs dropped by the one-per-ticker dedup, for the record. */
+export function dedupDropped(s: Snapshot): string[] {
+  const raw = s.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const kept = new Set(tradedComps(s).map((p) => p.slug));
+  return raw.filter((p) => !kept.has(p.slug)).map((p) => p.slug);
 }
 
 // ---------------------------------------------------------------- the fit
@@ -124,6 +153,14 @@ export function features(p: Protocol, asOfMs: number): number[] {
   return f;
 }
 
+/** The model itself: intercept + log10 TVL only. Everything else was tried and dropped
+ *  (see METHOD.md) — no other feature survives leave-one-out and the walk-forward splits. */
+export function sizeFeatures(p: Protocol): number[] {
+  return [1, Math.log10(Math.max(1, p.tvl_usd))];
+}
+
+export const SIZE_FEATURE_NAMES = ['intercept', 'log10_tvl'];
+
 export const targetOf = (p: Protocol): number =>
   clamp(Math.log((p.mcap_usd as number) / p.tvl_usd), TARGET_LO, TARGET_HI);
 
@@ -167,20 +204,48 @@ export function ridgeFit(X: number[][], y: number[], lambda: number): number[] {
   return solveLinear(A, b);
 }
 
+export interface ValidationStats {
+  r2: number;
+  median_abs_log_error: number;
+  mean_abs_log_error: number;
+}
+
+export interface TimeSplit {
+  label: string;
+  cutoff: string;
+  n_train: number;
+  n_test: number;
+  r2: number;
+  median_abs_log_error: number;
+}
+
 export interface FitResult {
   version: string;
   lambda: number;
   comps_used: number;
   comps_total: number;
+  comps_dedup_dropped: string[];
   target_winsor: [number, number];
   coefficients: Record<string, number>;
   feature_names: string[];
   /** Leave-one-out validation over the comps. */
-  loo: { r2: number; median_abs_log_error: number; mean_abs_log_error: number };
+  loo: ValidationStats;
   /** Deterministic 80/20 split: slug hash % 5 === 0 is the test set. */
   held_out: { n_test: number; r2: number; median_abs_log_error: number };
-  /** Size-only ridge as a benchmark: log10 TVL alone. */
-  size_only_loo: { r2: number; median_abs_log_error: number };
+  /** Walk-forward: fit on protocols listed before the cutoff, test on newer ones. */
+  time_splits: TimeSplit[];
+  /** The 20-feature ridge (age, growth, chains, categories) on the same comps, kept as
+   *  the benchmark that the size-only model had to beat — and did, out of sample. */
+  benchmark_full: {
+    lambda: number;
+    loo: ValidationStats;
+    held_out: { n_test: number; r2: number; median_abs_log_error: number };
+    time_splits: TimeSplit[];
+  };
+  /** Bootstrap rank stability: 200 deterministic refits on resampled comps. */
+  bootstrap: { resamples: number; seed: number; median_band_width: number; max_band_width: number };
+  /** Per-ranked-protocol bootstrap rank band (p10/p50/p90 of expected-value rank). */
+  bootstrap_bands: Record<string, BootstrapBand>;
   median_log_ratio: number;
   median_ratio: number;
 }
@@ -219,66 +284,168 @@ function looStats(
   };
 }
 
+/** Deterministic PRNG for the bootstrap (LCG, fixed seed): no Math.random anywhere. */
+function lcg(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+/** Walk-forward split: fit on comps listed before `cutoff`, test on comps listed on or
+ *  after it. Comps with an unknown listing date take part in neither side. */
+function timeSplitStats(
+  comps: Protocol[],
+  cutoff: string,
+  fitFn: (train: Protocol[], trainY: number[]) => (p: Protocol) => number,
+): TimeSplit {
+  const cut = Date.parse(cutoff + 'T00:00:00Z');
+  const train = comps.filter((p) => p.listed_at && Date.parse(p.listed_at + 'T00:00:00Z') < cut);
+  const test = comps.filter((p) => p.listed_at && Date.parse(p.listed_at + 'T00:00:00Z') >= cut);
+  const predict = fitFn(train, train.map(targetOf));
+  const errs = test.map((p) => targetOf(p) - predict(p));
+  const meanTest = test.reduce((a, p) => a + targetOf(p), 0) / test.length;
+  const ssTot = test.reduce((a, p) => a + (targetOf(p) - meanTest) ** 2, 0);
+  return {
+    label: `fit listed before ${cutoff.slice(0, 4)}, test ${cutoff.slice(0, 4)} and later`,
+    cutoff,
+    n_train: train.length,
+    n_test: test.length,
+    r2: 1 - errs.reduce((a, e) => a + e * e, 0) / ssTot,
+    median_abs_log_error: medianOf(errs.map(Math.abs)),
+  };
+}
+
+function heldOutStats(
+  comps: Protocol[],
+  fitFn: (train: Protocol[], trainY: number[]) => (p: Protocol) => number,
+): { n_test: number; r2: number; median_abs_log_error: number } {
+  const test = comps.filter((p) => slugHash(p.slug) % 5 === 0);
+  const train = comps.filter((p) => slugHash(p.slug) % 5 !== 0);
+  const predict = fitFn(train, train.map(targetOf));
+  const errs = test.map((p) => targetOf(p) - predict(p));
+  const meanTest = test.reduce((a, p) => a + targetOf(p), 0) / test.length;
+  const ssTot = test.reduce((a, p) => a + (targetOf(p) - meanTest) ** 2, 0);
+  return {
+    n_test: test.length,
+    r2: 1 - errs.reduce((a, e) => a + e * e, 0) / ssTot,
+    median_abs_log_error: medianOf(errs.map(Math.abs)),
+  };
+}
+
+export interface BootstrapBand {
+  p10: number;
+  p50: number;
+  p90: number;
+}
+
+/** Refit the size-only model on bootstrap resamples of the comps and record, for every
+ *  ranked protocol, the distribution of its expected-value rank. Deterministic: fixed
+ *  seed, fixed resample count, ties break by slug exactly as the board does. */
+function bootstrapBands(
+  comps: Protocol[],
+  ranked: Protocol[],
+  odds: OddsModel,
+  asOfMs: number,
+): { bands: Record<string, BootstrapBand>; median_band_width: number; max_band_width: number } {
+  const rnd = lcg(BOOTSTRAP_SEED);
+  const fitOn = (sample: Protocol[]) =>
+    ridgeFit(sample.map(sizeFeatures), sample.map(targetOf), RIDGE_LAMBDA);
+  const predictWith = (b: number[]) => (p: Protocol) =>
+    clamp(sizeFeatures(p).reduce((a, v, j) => a + v * b[j], 0), TARGET_LO, TARGET_HI);
+  const ranks: number[][] = ranked.map(() => []);
+  for (let r = 0; r < BOOTSTRAP_RESAMPLES; r++) {
+    const sample: Protocol[] = [];
+    for (let i = 0; i < comps.length; i++) sample.push(comps[Math.floor(rnd() * comps.length)]);
+    const predict = predictWith(fitOn(sample));
+    const evs = ranked.map((p) => {
+      const fdv = Math.max(1, Math.round(p.tvl_usd * Math.exp(predict(p))));
+      return fdv * tokenOdds(p, odds, asOfMs);
+    });
+    const order = evs
+      .map((ev, i) => [ev, i] as const)
+      .sort((a, b) => b[0] - a[0] || (ranked[a[1]].slug < ranked[b[1]].slug ? -1 : 1));
+    order.forEach(([, i], pos) => ranks[i].push(pos + 1));
+  }
+  const q = (sorted: number[], f: number) => sorted[Math.floor(f * (sorted.length - 1))];
+  const bands: Record<string, BootstrapBand> = {};
+  const widths: number[] = [];
+  ranked.forEach((p, i) => {
+    const rs = [...ranks[i]].sort((a, b) => a - b);
+    bands[p.slug] = { p10: q(rs, 0.1), p50: q(rs, 0.5), p90: q(rs, 0.9) };
+    widths.push(bands[p.slug].p90 - bands[p.slug].p10);
+  });
+  return { bands, median_band_width: medianOf(widths), max_band_width: Math.max(...widths) };
+}
+
+const TIME_SPLIT_CUTOFFS = ['2023-01-01', '2024-01-01', '2025-01-01'];
+
 export function fitLaunchModel(s: Snapshot): FitResult {
   const asOfMs = Date.parse(s.as_of + 'T00:00:00Z');
   const comps = tradedComps(s);
   const y = comps.map(targetOf);
-  const X = comps.map((p) => features(p, asOfMs));
-  const beta = ridgeFit(X, y, RIDGE_LAMBDA);
+
+  const sizeFit = (train: Protocol[], trainY: number[]) => {
+    const b = ridgeFit(train.map(sizeFeatures), trainY, RIDGE_LAMBDA);
+    return (p: Protocol) =>
+      clamp(sizeFeatures(p).reduce((a, v, j) => a + v * b[j], 0), TARGET_LO, TARGET_HI);
+  };
+  const fullFit = (train: Protocol[], trainY: number[]) => {
+    const b = ridgeFit(train.map((p) => features(p, asOfMs)), trainY, FULL_LAMBDA);
+    return (p: Protocol) =>
+      clamp(features(p, asOfMs).reduce((a, v, j) => a + v * b[j], 0), TARGET_LO, TARGET_HI);
+  };
+
+  const beta = ridgeFit(comps.map(sizeFeatures), y, RIDGE_LAMBDA);
   const coefficients: Record<string, number> = {};
-  FEATURE_NAMES.forEach((n, i) => {
+  SIZE_FEATURE_NAMES.forEach((n, i) => {
     coefficients[n] = beta[i];
   });
 
-  const predictWith = (b: number[]) => (p: Protocol) =>
-    features(p, asOfMs).reduce((a, v, j) => a + v * b[j], 0);
+  const loo = looStats(comps, y, asOfMs, sizeFit);
+  const heldOut = heldOutStats(comps, sizeFit);
+  const timeSplits = TIME_SPLIT_CUTOFFS.map((c) => timeSplitStats(comps, c, sizeFit));
+  const looFull = looStats(comps, y, asOfMs, fullFit);
+  const heldOutFull = heldOutStats(comps, fullFit);
+  const timeSplitsFull = TIME_SPLIT_CUTOFFS.map((c) => timeSplitStats(comps, c, fullFit));
 
-  const loo = looStats(comps, y, asOfMs, (train, trainY) =>
-    predictWith(ridgeFit(train.map((p) => features(p, asOfMs)), trainY, RIDGE_LAMBDA)),
-  );
-  const sizeOnly = looStats(comps, y, asOfMs, (train, trainY) => {
-    const b = ridgeFit(
-      train.map((p) => [1, Math.log10(Math.max(1, p.tvl_usd))]),
-      trainY,
-      1,
-    );
-    return (p: Protocol) => b[0] + b[1] * Math.log10(Math.max(1, p.tvl_usd));
-  });
-
-  const test = comps.filter((p) => slugHash(p.slug) % 5 === 0);
-  const train = comps.filter((p) => slugHash(p.slug) % 5 !== 0);
-  const bTrain = ridgeFit(
-    train.map((p) => features(p, asOfMs)),
-    train.map(targetOf),
-    RIDGE_LAMBDA,
-  );
-  const testErrs = test.map((p) => targetOf(p) - predictWith(bTrain)(p));
-  const meanTest = test.reduce((a, p) => a + targetOf(p), 0) / test.length;
-  const ssTotTest = test.reduce((a, p) => a + (targetOf(p) - meanTest) ** 2, 0);
-  const heldOut = {
-    n_test: test.length,
-    r2: 1 - testErrs.reduce((a, e) => a + e * e, 0) / ssTotTest,
-    median_abs_log_error: medianOf(testErrs.map(Math.abs)),
-  };
+  const odds = fitTokenOdds(s);
+  const ranked = s.protocols.filter(isRankable);
+  const boot = bootstrapBands(comps, ranked, odds, asOfMs);
 
   return {
     version: MODEL_VERSION,
     lambda: RIDGE_LAMBDA,
     comps_used: comps.length,
     comps_total: s.protocols.filter((p) => p.mcap_usd !== null).length,
+    comps_dedup_dropped: dedupDropped(s),
     target_winsor: [TARGET_LO, TARGET_HI],
     coefficients,
-    feature_names: [...FEATURE_NAMES],
+    feature_names: [...SIZE_FEATURE_NAMES],
     loo,
     held_out: heldOut,
-    size_only_loo: sizeOnly,
+    time_splits: timeSplits,
+    benchmark_full: {
+      lambda: FULL_LAMBDA,
+      loo: looFull,
+      held_out: heldOutFull,
+      time_splits: timeSplitsFull,
+    },
+    bootstrap: {
+      resamples: BOOTSTRAP_RESAMPLES,
+      seed: BOOTSTRAP_SEED,
+      median_band_width: boot.median_band_width,
+      max_band_width: boot.max_band_width,
+    },
+    bootstrap_bands: boot.bands,
     median_log_ratio: medianOf(y),
     median_ratio: Math.exp(medianOf(y)),
   };
 }
 
 export function predictLogRatio(p: Protocol, fit: FitResult, asOfMs: number): number {
-  const x = features(p, asOfMs);
+  const x = sizeFeatures(p);
   return clamp(
     x.reduce((a, v, j) => a + v * fit.coefficients[fit.feature_names[j]], 0),
     TARGET_LO,
@@ -287,7 +454,7 @@ export function predictLogRatio(p: Protocol, fit: FitResult, asOfMs: number): nu
 }
 
 export function contributions(p: Protocol, fit: FitResult, asOfMs: number): Record<string, number> {
-  const x = features(p, asOfMs);
+  const x = sizeFeatures(p);
   const out: Record<string, number> = {};
   fit.feature_names.forEach((n, j) => {
     out[n] = x[j] * fit.coefficients[n];
@@ -481,6 +648,10 @@ export interface BoardRow {
   fitted_ratio: number;
   model_log_ratio: number;
   model_contributions: Record<string, number>;
+  /** Bootstrap rank band: p10/p50/p90 of this row's expected-value rank over 200 refits. */
+  bootstrap_rank_p10: number;
+  bootstrap_rank_p50: number;
+  bootstrap_rank_p90: number;
   farm_steps: string[];
   farm: FarmPlan;
 }
@@ -494,6 +665,15 @@ export interface LiveRow {
   mcap_usd: number;
   fdv_tvl_ratio: number;
   age_days: number | null;
+}
+
+export interface UnrankedRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  tvl_usd: number;
+  /** live_token | excluded_category | versioned_name | wrapped_or_staked_name | exchange_name */
+  reason: string;
 }
 
 export interface Board {
@@ -510,8 +690,12 @@ export interface Board {
     comps_used: number;
     live_total: number;
     live_shown: number;
+    /** Every protocol in the snapshot, by fate: ranked + one count per unranked reason. */
+    census: Record<string, number>;
   };
   rows: BoardRow[];
+  /** Every protocol not ranked, with the reason it is not ranked. Ranked + unranked = 758. */
+  unranked: UnrankedRow[];
   live: LiveRow[];
 }
 
@@ -546,6 +730,9 @@ export function buildBoard(s: Snapshot): Board {
         fitted_ratio: Math.round(ratio * 10000) / 10000,
         model_log_ratio: Math.round(logRatio * 1000) / 1000,
         model_contributions: contributions(p, fit, asOfMs),
+        bootstrap_rank_p10: 0,
+        bootstrap_rank_p50: 0,
+        bootstrap_rank_p90: 0,
         farm_steps: farm.steps,
         farm,
       };
@@ -554,7 +741,25 @@ export function buildBoard(s: Snapshot): Board {
     .sort((a, b) => b.implied_value_usd - a.implied_value_usd || (a.slug < b.slug ? -1 : 1));
   ranked.forEach((r, i) => {
     r.rank = i + 1;
+    const band = fit.bootstrap_bands[r.slug];
+    r.bootstrap_rank_p10 = band.p10;
+    r.bootstrap_rank_p50 = band.p50;
+    r.bootstrap_rank_p90 = band.p90;
   });
+
+  const rankedSlugs = new Set(ranked.map((r) => r.slug));
+  const unranked: UnrankedRow[] = s.protocols
+    .filter((p) => !rankedSlugs.has(p.slug))
+    .map((p) => ({
+      slug: p.slug,
+      name: p.name,
+      category: p.category,
+      tvl_usd: p.tvl_usd,
+      reason: unrankableReason(p) as string,
+    }))
+    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1));
+  const census: Record<string, number> = { ranked: ranked.length };
+  for (const u of unranked) census[u.reason] = (census[u.reason] ?? 0) + 1;
 
   const live = s.protocols
     .filter((p) => !isPreToken(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
@@ -586,8 +791,10 @@ export function buildBoard(s: Snapshot): Board {
       comps_used: fit.comps_used,
       live_total: s.protocols.filter((p) => !isPreToken(p)).length,
       live_shown: live.length,
+      census,
     },
     rows: ranked,
+    unranked,
     live,
   };
 }
@@ -595,6 +802,9 @@ export function buildBoard(s: Snapshot): Board {
 /** The board's own gate: the same checks main.ts enforces before writing the dossier. */
 export function boardIssue(b: Board, watchlist: string[]): string | null {
   if (b.rows.length < 100) return `board has ${b.rows.length} rows, fewer than 100`;
+  if (b.rows.length + b.unranked.length !== b.meta.protocols_total) {
+    return `census mismatch: ${b.rows.length} ranked + ${b.unranked.length} unranked != ${b.meta.protocols_total} protocols`;
+  }
   for (let i = 0; i < b.rows.length; i++) {
     const r = b.rows[i];
     if (r.rank !== i + 1) return `row ${i} has rank ${r.rank}, expected ${i + 1}`;
@@ -603,6 +813,14 @@ export function boardIssue(b: Board, watchlist: string[]): string | null {
     }
     if (!Number.isFinite(r.implied_value_usd) || r.implied_value_usd < 0) {
       return `row ${r.rank} has a bad implied value`;
+    }
+    if (
+      r.bootstrap_rank_p10 < 1 ||
+      r.bootstrap_rank_p90 > b.rows.length ||
+      r.bootstrap_rank_p10 > r.bootstrap_rank_p50 ||
+      r.bootstrap_rank_p50 > r.bootstrap_rank_p90
+    ) {
+      return `row ${r.rank} has a bad bootstrap rank band ${r.bootstrap_rank_p10}-${r.bootstrap_rank_p50}-${r.bootstrap_rank_p90}`;
     }
     if (r.farm_steps.length < 3 || r.farm_steps.length > 12) {
       return `row ${r.rank} has ${r.farm_steps.length} farm steps, expected 3..12`;

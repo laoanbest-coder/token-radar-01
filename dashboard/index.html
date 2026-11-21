@@ -18,6 +18,7 @@
   <button data-tab="board" class="active" role="tab">Board</button>
   <button data-tab="live" role="tab">Live tokens</button>
   <button data-tab="model" role="tab">Model &amp; method</button>
+  <button data-tab="census" role="tab">Census</button>
 </nav>
 
 <section id="tab-board">
@@ -39,13 +40,13 @@
   <p class="count" id="count"></p>
   <div class="tablewrap"><table id="board">
     <thead><tr>
-      <th>#</th><th>Protocol</th><th>Category</th><th>Chains</th><th>TVL</th><th>7d</th>
+      <th>#</th><th>Rank range</th><th>Protocol</th><th>Category</th><th>Chains</th><th>TVL</th><th>7d</th>
       <th>Age</th><th>Fitted launch value</th><th>Token odds</th><th>Expected value</th>
       <th>Farm cost</th><th>Net EV</th><th>$/hour</th><th></th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table></div>
-  <p class="note">Expected value = token odds × fitted launch value. Farm cost = capital + gas. Net EV subtracts the farm cost. A protocol “records no token” in the snapshot; that is not a claim it has none.</p>
+  <p class="note">Expected value = token odds × fitted launch value. Farm cost = capital + gas. Net EV subtracts the farm cost. Rank range is the p10–p90 band of the row's rank over 200 bootstrap refits of the model — a narrow band means the rank is stable, not that the value is precise. A protocol “records no token” in the snapshot; that is not a claim it has none.</p>
 </section>
 
 <section id="tab-live" hidden>
@@ -60,10 +61,9 @@
   <h2>How the numbers are made</h2>
   <div id="model"></div>
   <h3>Try it yourself</h3>
-  <p>Move the sliders to see how the board changes. The growth weight scales the 7-day growth term; the category weight blends the category effect toward zero. The base fit is the one reported above.</p>
+  <p>Move the slider to change the size slope — the one fitted number the whole board hangs on — and see how the board changes. The fitted slope is shown as the default. A flatter slope (closer to 0) says big protocols are worth nearly as much per TVL dollar as small ones; a steeper slope says value concentrates in the small.</p>
   <div class="sandbox">
-    <label>Growth weight <input id="wGrowth" type="range" min="0" max="2" step="0.1" value="1"> <span id="wGrowthVal">1.0×</span></label>
-    <label>Category weight <input id="wCat" type="range" min="0" max="1" step="0.1" value="1"> <span id="wCatVal">1.0×</span></label>
+    <label>Size slope (log<sub>10</sub> TVL coefficient) <input id="wSlope" type="range" min="-1.4" max="-0.6" step="0.01" value="-1.02"> <span id="wSlopeVal">−1.02</span></label>
   </div>
   <p class="count" id="sandboxNote"></p>
   <h3>What the model cannot see</h3>
@@ -74,6 +74,12 @@
     <li>Gas costs are stated typicals for November 2026, not quotes. Farm plans assume the wallet already holds stablecoins.</li>
     <li>Expected value is not a promise: every row's expected value clears its farm cost by a wide margin, because fitted launch values are in the millions and farm capital is $50–$250. The binding uncertainty is the fitted value itself (median error ×3.5) and the token odds — not the cost.</li>
   </ul>
+</section>
+
+<section id="tab-census" hidden>
+  <h2>Every protocol in the snapshot, accounted for</h2>
+  <p class="lede" id="censusLede"></p>
+  <div id="census"></div>
 </section>
 
 <dialog id="detail"><div id="detailBody"></div><button id="closeDetail">Close</button></dialog>

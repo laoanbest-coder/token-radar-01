@@ -93,7 +93,9 @@ function main(): void {
   writeFileSync(join(outDir, 'dossier.json'), dossier);
 
   console.log(`board: ${board.rows.length} ranked rows, ${board.meta.watchlist_ranked}/${board.meta.watchlist_total} watchlist covered`);
-  console.log(`model: ridge lambda ${board.model.lambda}, ${board.model.comps_used} comps, LOO R2 ${board.model.loo.r2.toFixed(3)}, held-out R2 ${board.model.held_out.r2.toFixed(3)}`);
+  console.log(`census: ${board.meta.protocols_total} accounted (${board.meta.census.ranked} ranked, ${board.meta.census.live_token ?? 0} live, ${board.unranked.length - (board.meta.census.live_token ?? 0)} pre-token excluded)`);
+  console.log(`model: ridge lambda ${board.model.lambda}, ${board.model.comps_used} comps, LOO R2 ${board.model.loo.r2.toFixed(3)}, held-out R2 ${board.model.held_out.r2.toFixed(3)}, time-splits ${board.model.time_splits.map((t) => t.r2.toFixed(2)).join('/')}`);
+  console.log(`bootstrap: ${board.model.bootstrap.resamples} refits, median rank band ${board.model.bootstrap.median_band_width}, max ${board.model.bootstrap.max_band_width}`);
   console.log(`top EV: ${board.rows[0].name} $${board.rows[0].implied_value_usd.toLocaleString('en-US')}`);
   console.log(`screenshots: ${shots.length}, dossier: ${dossier.length} bytes`);
   console.log(`wrote ${outDir}`);
