@@ -1,3 +1,7 @@
+[![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01)
+[![rank](https://make.fun/badge/token-radar-01/laoanbest-coder/token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard)
+[![reward](https://make.fun/badge/token-radar-01/laoanbest-coder/token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01)
+
 # Token Launch Radar
 
 A token launch radar built for make.fun's [Build the best token launch radar](https://make.fun/bounty/token-radar-01) bounty.
