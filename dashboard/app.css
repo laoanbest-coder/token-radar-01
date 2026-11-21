@@ -10,7 +10,16 @@ header h1{font-size:28px;margin:0 0 2px}
 .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin:0 0 8px}
 .controls label{font-size:13px;color:#39415a}
 .controls input[type=search],.controls select{padding:6px 8px;border:1px solid #b9b2a0;border-radius:4px;font-size:14px;background:#fff}
-.count{font-size:13px;color:#5a6478;margin:4px 0 10px}
+.kpi{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 10px}
+.kpi div{background:#fff;border:1px solid #d8d2c2;border-top:3px solid #1c2333;padding:8px 12px;min-width:150px;flex:1}
+.kpi b{display:block;font-size:19px}
+.kpi span{font-size:12px;color:#5a6478}
+.integrity{background:#eef3e6;border:1px solid #b9c9a4;padding:10px 12px;margin:0 0 12px;font-size:13px}
+.integrity>b{display:block;margin-bottom:4px}
+.integrity ul{margin:0;padding-left:18px;columns:2;column-gap:28px}
+.integrity li{margin:2px 0;break-inside:avoid}
+.integrity .fail{color:#a11d1d}
+dialog td{white-space:normal}
 .tablewrap{overflow-x:auto;background:#fff;border:1px solid #d8d2c2}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{padding:6px 7px;border-bottom:1px solid #e6e1d3;text-align:right;white-space:nowrap}

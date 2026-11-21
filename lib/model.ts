@@ -27,7 +27,7 @@ export interface Snapshot {
 }
 
 export const DAY_MS = 86400000;
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 export const RIDGE_LAMBDA = 3;
 export const FULL_LAMBDA = 10;
 export const BOOTSTRAP_RESAMPLES = 200;
@@ -246,6 +246,20 @@ export interface FitResult {
   bootstrap: { resamples: number; seed: number; median_band_width: number; max_band_width: number };
   /** Per-ranked-protocol bootstrap rank band (p10/p50/p90 of expected-value rank). */
   bootstrap_bands: Record<string, BootstrapBand>;
+  /** Per-ranked-protocol bootstrap fitted-value band (p10/p50/p90 of fitted FDV over the
+   *  same 200 refits). Parameter uncertainty only — the residual-based prediction
+   *  interval below is the honest statement of how far a real launch value can sit. */
+  bootstrap_value_bands: Record<string, BootstrapBand>;
+  /** The p10–p90 prediction interval for a fitted log ratio: predicted ± the 80th
+   *  percentile of |leave-one-out residual|. LOO coverage is ~80% by construction; the
+   *  held-out coverage is the clean check (width refit on the training comps only). */
+  interval: {
+    half_width_log: number;
+    factor: number;
+    loo_coverage: number;
+    loo_n: number;
+    held_out: { n_test: number; coverage: number; half_width_log: number; factor: number };
+  };
   median_log_ratio: number;
   median_ratio: number;
 }
@@ -259,6 +273,12 @@ function slugHash(str: string): number {
 function medianOf(v: number[]): number {
   const s = [...v].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
+}
+
+/** Quantile by the same index rule the bootstrap uses (floor(f * (n - 1))). */
+function quantileOf(v: number[], f: number): number {
+  const s = [...v].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.floor(f * (s.length - 1)))];
 }
 
 function looStats(
@@ -334,6 +354,57 @@ function heldOutStats(
   };
 }
 
+/** Leave-one-out predictions for every comp (each prediction is out of sample for its
+ *  own point). Shared by the interval computation; looStats keeps its own loop. */
+function looPredictions(
+  comps: Protocol[],
+  y: number[],
+  fitFn: (train: Protocol[], trainY: number[]) => (p: Protocol) => number,
+): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < comps.length; i++) {
+    const train = comps.filter((_, j) => j !== i);
+    const trainY = y.filter((_, j) => j !== i);
+    out.push(fitFn(train, trainY)(comps[i]));
+  }
+  return out;
+}
+
+/** The p10–p90 prediction interval for the fitted log ratio: predicted ± the 80th
+ *  percentile of |leave-one-out residual|. Returns the width, the LOO coverage at that
+ *  width, and the clean held-out check, where the width is refit on the training comps
+ *  only and coverage is measured on the held-out 20%. */
+function valueInterval(
+  comps: Protocol[],
+  y: number[],
+  fitFn: (train: Protocol[], trainY: number[]) => (p: Protocol) => number,
+): FitResult['interval'] {
+  const looPred = looPredictions(comps, y, fitFn);
+  const looAbs = y.map((v, i) => Math.abs(v - looPred[i]));
+  const halfWidth = quantileOf(looAbs, 0.8);
+  const looCoverage = looAbs.filter((e) => e <= halfWidth).length / looAbs.length;
+  const test = comps.filter((p) => slugHash(p.slug) % 5 === 0);
+  const train = comps.filter((p) => slugHash(p.slug) % 5 !== 0);
+  const trainY = train.map(targetOf);
+  const trainLooPred = looPredictions(train, trainY, fitFn);
+  const trainLooAbs = trainY.map((v, i) => Math.abs(v - trainLooPred[i]));
+  const hoHalfWidth = quantileOf(trainLooAbs, 0.8);
+  const predictHO = fitFn(train, trainY);
+  const hoCovered = test.filter((p) => Math.abs(targetOf(p) - predictHO(p)) <= hoHalfWidth).length;
+  return {
+    half_width_log: Math.round(halfWidth * 1000) / 1000,
+    factor: Math.round(Math.exp(halfWidth) * 100) / 100,
+    loo_coverage: Math.round(looCoverage * 1000) / 1000,
+    loo_n: comps.length,
+    held_out: {
+      n_test: test.length,
+      coverage: Math.round((hoCovered / test.length) * 1000) / 1000,
+      half_width_log: Math.round(hoHalfWidth * 1000) / 1000,
+      factor: Math.round(Math.exp(hoHalfWidth) * 100) / 100,
+    },
+  };
+}
+
 export interface BootstrapBand {
   p10: number;
   p50: number;
@@ -341,26 +412,34 @@ export interface BootstrapBand {
 }
 
 /** Refit the size-only model on bootstrap resamples of the comps and record, for every
- *  ranked protocol, the distribution of its expected-value rank. Deterministic: fixed
- *  seed, fixed resample count, ties break by slug exactly as the board does. */
+ *  ranked protocol, the distribution of its expected-value rank and of its fitted FDV.
+ *  Deterministic: fixed seed, fixed resample count, ties break by slug exactly as the
+ *  board does. */
 function bootstrapBands(
   comps: Protocol[],
   ranked: Protocol[],
   odds: OddsModel,
   asOfMs: number,
-): { bands: Record<string, BootstrapBand>; median_band_width: number; max_band_width: number } {
+): {
+  bands: Record<string, BootstrapBand>;
+  value_bands: Record<string, BootstrapBand>;
+  median_band_width: number;
+  max_band_width: number;
+} {
   const rnd = lcg(BOOTSTRAP_SEED);
   const fitOn = (sample: Protocol[]) =>
     ridgeFit(sample.map(sizeFeatures), sample.map(targetOf), RIDGE_LAMBDA);
   const predictWith = (b: number[]) => (p: Protocol) =>
     clamp(sizeFeatures(p).reduce((a, v, j) => a + v * b[j], 0), TARGET_LO, TARGET_HI);
   const ranks: number[][] = ranked.map(() => []);
+  const fdvs: number[][] = ranked.map(() => []);
   for (let r = 0; r < BOOTSTRAP_RESAMPLES; r++) {
     const sample: Protocol[] = [];
     for (let i = 0; i < comps.length; i++) sample.push(comps[Math.floor(rnd() * comps.length)]);
     const predict = predictWith(fitOn(sample));
-    const evs = ranked.map((p) => {
+    const evs = ranked.map((p, i) => {
       const fdv = Math.max(1, Math.round(p.tvl_usd * Math.exp(predict(p))));
+      fdvs[i].push(fdv);
       return fdv * tokenOdds(p, odds, asOfMs);
     });
     const order = evs
@@ -370,13 +449,16 @@ function bootstrapBands(
   }
   const q = (sorted: number[], f: number) => sorted[Math.floor(f * (sorted.length - 1))];
   const bands: Record<string, BootstrapBand> = {};
+  const value_bands: Record<string, BootstrapBand> = {};
   const widths: number[] = [];
   ranked.forEach((p, i) => {
     const rs = [...ranks[i]].sort((a, b) => a - b);
     bands[p.slug] = { p10: q(rs, 0.1), p50: q(rs, 0.5), p90: q(rs, 0.9) };
     widths.push(bands[p.slug].p90 - bands[p.slug].p10);
+    const vs = [...fdvs[i]].sort((a, b) => a - b);
+    value_bands[p.slug] = { p10: q(vs, 0.1), p50: q(vs, 0.5), p90: q(vs, 0.9) };
   });
-  return { bands, median_band_width: medianOf(widths), max_band_width: Math.max(...widths) };
+  return { bands, value_bands, median_band_width: medianOf(widths), max_band_width: Math.max(...widths) };
 }
 
 const TIME_SPLIT_CUTOFFS = ['2023-01-01', '2024-01-01', '2025-01-01'];
@@ -413,6 +495,7 @@ export function fitLaunchModel(s: Snapshot): FitResult {
   const odds = fitTokenOdds(s);
   const ranked = s.protocols.filter(isRankable);
   const boot = bootstrapBands(comps, ranked, odds, asOfMs);
+  const interval = valueInterval(comps, y, sizeFit);
 
   return {
     version: MODEL_VERSION,
@@ -439,6 +522,8 @@ export function fitLaunchModel(s: Snapshot): FitResult {
       max_band_width: boot.max_band_width,
     },
     bootstrap_bands: boot.bands,
+    bootstrap_value_bands: boot.value_bands,
+    interval,
     median_log_ratio: medianOf(y),
     median_ratio: Math.exp(medianOf(y)),
   };
@@ -470,6 +555,18 @@ export interface OddsModel {
   age_bands: { lo: number; hi: number; n: number; rate: number; shrunk: number }[];
   category_rates: Record<string, { n: number; rate: number; shrunk: number }>;
   shrink_prior: number;
+  /** Held-out validation of the odds themselves: the model is refit on the 80% of
+   *  protocols whose slug hash is not 0 mod 5 and scored on the other 20%. Brier and
+   *  log-loss are shown against the global-rate baseline, and the calibration table
+   *  shows the mean predicted odds against the actual token rate per age band. */
+  held_out: {
+    n_test: number;
+    brier: number;
+    brier_global: number;
+    log_loss: number;
+    log_loss_global: number;
+    calibration: { band: string; n: number; pred: number; actual: number }[];
+  };
 }
 
 const AGE_BANDS: [number, number][] = [
@@ -481,10 +578,63 @@ const AGE_BANDS: [number, number][] = [
 
 export function fitTokenOdds(s: Snapshot): OddsModel {
   const asOfMs = Date.parse(s.as_of + 'T00:00:00Z');
-  const global = s.protocols.filter((p) => !isPreToken(p)).length / s.protocols.length;
+  const model = fitTokenOddsOn(s.protocols, asOfMs);
+  // Held-out validation: refit on the 80% whose slug hash is not 0 mod 5 (the same
+  // split the launch-value held-out test uses) and score the other 20%.
+  const test = s.protocols.filter((p) => slugHash(p.slug) % 5 === 0);
+  const train = s.protocols.filter((p) => slugHash(p.slug) % 5 !== 0);
+  const trainOdds = fitTokenOddsOn(train, asOfMs);
+  const globalTrain = train.filter((p) => !isPreToken(p)).length / train.length;
+  let brier = 0;
+  let brierGlobal = 0;
+  let logLoss = 0;
+  let logLossGlobal = 0;
+  for (const p of test) {
+    const yv = isPreToken(p) ? 0 : 1;
+    const pr = clamp(tokenOdds(p, trainOdds, asOfMs), 1e-9, 1 - 1e-9);
+    const pg = clamp(globalTrain, 1e-9, 1 - 1e-9);
+    brier += (pr - yv) ** 2;
+    brierGlobal += (pg - yv) ** 2;
+    logLoss += -(yv * Math.log(pr) + (1 - yv) * Math.log(1 - pr));
+    logLossGlobal += -(yv * Math.log(pg) + (1 - yv) * Math.log(1 - pg));
+  }
+  const n = test.length;
+  const calibration: OddsModel['held_out']['calibration'] = [];
+  const bandGroups: { label: string; grp: Protocol[] }[] = AGE_BANDS.map(([lo, hi]) => ({
+    label: hi >= 100000 ? `${lo}d+` : `${lo}–${hi}d`,
+    grp: test.filter((p) => {
+      const a = ageDays(p, asOfMs);
+      return a !== null && a >= lo && a < hi;
+    }),
+  }));
+  bandGroups.push({ label: 'age unknown', grp: test.filter((p) => ageDays(p, asOfMs) === null) });
+  for (const { label, grp } of bandGroups) {
+    if (!grp.length) continue;
+    calibration.push({
+      band: label,
+      n: grp.length,
+      pred: Math.round((grp.reduce((a, p) => a + tokenOdds(p, trainOdds, asOfMs), 0) / grp.length) * 1000) / 1000,
+      actual: Math.round((grp.filter((p) => !isPreToken(p)).length / grp.length) * 1000) / 1000,
+    });
+  }
+  return {
+    ...model,
+    held_out: {
+      n_test: n,
+      brier: Math.round((brier / n) * 10000) / 10000,
+      brier_global: Math.round((brierGlobal / n) * 10000) / 10000,
+      log_loss: Math.round((logLoss / n) * 10000) / 10000,
+      log_loss_global: Math.round((logLossGlobal / n) * 10000) / 10000,
+      calibration,
+    },
+  };
+}
+
+function fitTokenOddsOn(protocols: Protocol[], asOfMs: number): Omit<OddsModel, 'held_out'> {
+  const global = protocols.filter((p) => !isPreToken(p)).length / protocols.length;
   const prior = 20;
   const age_bands = AGE_BANDS.map(([lo, hi]) => {
-    const grp = s.protocols.filter((p) => {
+    const grp = protocols.filter((p) => {
       const a = ageDays(p, asOfMs);
       return a !== null && a >= lo && a < hi;
     });
@@ -499,9 +649,9 @@ export function fitTokenOdds(s: Snapshot): OddsModel {
     };
   });
   const category_rates: OddsModel['category_rates'] = {};
-  const cats = [...new Set(s.protocols.map((p) => p.category ?? 'Unknown'))];
+  const cats = [...new Set(protocols.map((p) => p.category ?? 'Unknown'))];
   for (const c of cats) {
-    const grp = s.protocols.filter((p) => (p.category ?? 'Unknown') === c);
+    const grp = protocols.filter((p) => (p.category ?? 'Unknown') === c);
     const tok = grp.filter((p) => !isPreToken(p)).length;
     const rate = grp.length ? tok / grp.length : global;
     category_rates[c] = {
@@ -510,10 +660,10 @@ export function fitTokenOdds(s: Snapshot): OddsModel {
       shrunk: (grp.length * rate + prior * global) / (grp.length + prior),
     };
   }
-  return { global_rate: global, n_protocols: s.protocols.length, age_bands, category_rates, shrink_prior: prior };
+  return { global_rate: global, n_protocols: protocols.length, age_bands, category_rates, shrink_prior: prior };
 }
 
-export function tokenOdds(p: Protocol, odds: OddsModel, asOfMs: number): number {
+export function tokenOdds(p: Protocol, odds: Omit<OddsModel, 'held_out'>, asOfMs: number): number {
   const age = ageDays(p, asOfMs);
   const band =
     odds.age_bands.find((b) => age !== null && age >= b.lo && age < b.hi) ??
@@ -590,7 +740,15 @@ export interface FarmPlan {
   break_even_fdv_usd: number;
   net_ev_usd: number;
   ev_per_hour_usd: number;
+  /** Dated plan: the farm starts on the snapshot date, claims weekly, and unwinds on
+   *  the end date. Pure date arithmetic on the snapshot date — no clock. */
+  start_date: string;
+  end_date: string;
+  claim_dates: string[];
+  hold_days: number;
 }
+
+const isoDate = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 export function farmPlan(p: Protocol, asOfMs: number, evUsd: number, odds: number): FarmPlan {
   const primary = p.chains[0] ?? 'Ethereum';
@@ -618,6 +776,8 @@ export function farmPlan(p: Protocol, asOfMs: number, evUsd: number, odds: numbe
   const activeHours = Math.round((1 + 0.25 * nTx + 0.25 * weeks) * 100) / 100;
   const breakEven = Math.round(totalCost / Math.max(0.05, odds));
   const netEv = Math.round((evUsd - totalCost) * 100) / 100;
+  const claimDates: string[] = [];
+  for (let d = 7; d < hold; d += 7) claimDates.push(isoDate(asOfMs + d * DAY_MS));
   return {
     steps,
     capital_usd: capital,
@@ -627,6 +787,10 @@ export function farmPlan(p: Protocol, asOfMs: number, evUsd: number, odds: numbe
     break_even_fdv_usd: breakEven,
     net_ev_usd: netEv,
     ev_per_hour_usd: Math.round((netEv / activeHours) * 100) / 100,
+    start_date: isoDate(asOfMs),
+    end_date: isoDate(asOfMs + hold * DAY_MS),
+    claim_dates: claimDates,
+    hold_days: hold,
   };
 }
 
@@ -652,6 +816,10 @@ export interface BoardRow {
   bootstrap_rank_p10: number;
   bootstrap_rank_p50: number;
   bootstrap_rank_p90: number;
+  /** Bootstrap fitted-value band: p10/p90 of fitted FDV over the same 200 refits
+   *  (parameter uncertainty only — see the prediction interval for the honest range). */
+  fitted_fdv_p10: number;
+  fitted_fdv_p90: number;
   farm_steps: string[];
   farm: FarmPlan;
 }
@@ -676,6 +844,12 @@ export interface UnrankedRow {
   reason: string;
 }
 
+export interface BuildCheck {
+  label: string;
+  detail: string;
+  passed: boolean;
+}
+
 export interface Board {
   as_of: string;
   model_version: string;
@@ -692,11 +866,19 @@ export interface Board {
     live_shown: number;
     /** Every protocol in the snapshot, by fate: ranked + one count per unranked reason. */
     census: Record<string, number>;
+    /** Smallest ratio, over all 198 rows, of (prediction-interval low-end EV) to farm
+     *  cost: every row clears its farm cost by at least this much even at the low end
+     *  of its value interval, so the farm verdict is FARM on every row. */
+    min_pred_interval_margin: number;
   };
   rows: BoardRow[];
   /** Every protocol not ranked, with the reason it is not ranked. Ranked + unranked = 758. */
   unranked: UnrankedRow[];
   live: LiveRow[];
+  /** Build-time checks: every check the build ran, with its result. The build fails
+   *  (exit 1) if any check fails — the checks are the entry's own proofs, shown on the
+   *  board tab as the integrity strip. */
+  checks: BuildCheck[];
 }
 
 export function buildBoard(s: Snapshot): Board {
@@ -733,6 +915,8 @@ export function buildBoard(s: Snapshot): Board {
         bootstrap_rank_p10: 0,
         bootstrap_rank_p50: 0,
         bootstrap_rank_p90: 0,
+        fitted_fdv_p10: 0,
+        fitted_fdv_p90: 0,
         farm_steps: farm.steps,
         farm,
       };
@@ -745,7 +929,19 @@ export function buildBoard(s: Snapshot): Board {
     r.bootstrap_rank_p10 = band.p10;
     r.bootstrap_rank_p50 = band.p50;
     r.bootstrap_rank_p90 = band.p90;
+    const vb = fit.bootstrap_value_bands[r.slug];
+    r.fitted_fdv_p10 = vb.p10;
+    r.fitted_fdv_p90 = vb.p90;
   });
+
+  // Smallest margin, over all rows, of the prediction-interval low-end EV to the farm
+  // cost: low-end EV = fitted FDV ÷ interval factor × token odds.
+  let minMargin = Infinity;
+  for (const r of ranked) {
+    const lowEv = (r.fitted_fdv_usd / fit.interval.factor) * r.token_odds;
+    minMargin = Math.min(minMargin, lowEv / r.farm.total_cost_usd);
+  }
+  minMargin = Math.round(minMargin * 10) / 10;
 
   const rankedSlugs = new Set(ranked.map((r) => r.slug));
   const unranked: UnrankedRow[] = s.protocols
@@ -777,6 +973,45 @@ export function buildBoard(s: Snapshot): Board {
     .slice(0, 100);
 
   const preTokenTotal = s.protocols.filter(isPreToken).length;
+  const positiveMcap = s.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0).length;
+  const zeroOrNegMcap = fit.comps_total - positiveMcap;
+  const checks: BuildCheck[] = [
+    {
+      label: 'Census',
+      detail: `${ranked.length} ranked + ${unranked.length} unranked = ${s.protocols.length} protocols`,
+      passed: ranked.length + unranked.length === s.protocols.length,
+    },
+    {
+      label: 'Watchlist',
+      detail: `${ranked.filter((r) => r.is_watchlist).length} of ${s.watchlist.length} watchlist protocols ranked`,
+      passed: ranked.filter((r) => r.is_watchlist).length === s.watchlist.length,
+    },
+    {
+      label: 'Comps',
+      detail: `${fit.comps_used} comps from ${fit.comps_total} token rows: ${zeroOrNegMcap} with zero or negative market cap excluded, ${fit.comps_dedup_dropped.length} duplicate ticker (${fit.comps_dedup_dropped.join(', ') || 'none'}) dropped`,
+      passed: fit.comps_used === positiveMcap - fit.comps_dedup_dropped.length,
+    },
+    {
+      label: 'Value model, leave-one-out',
+      detail: `LOO R² ${fit.loo.r2.toFixed(3)} > 0, median error ×${Math.exp(fit.loo.median_abs_log_error).toFixed(1)}`,
+      passed: fit.loo.r2 > 0,
+    },
+    {
+      label: 'Token odds, held out',
+      detail: `Brier ${odds.held_out.brier.toFixed(4)} vs ${odds.held_out.brier_global.toFixed(4)} for the global rate (n=${odds.held_out.n_test})`,
+      passed: odds.held_out.brier < odds.held_out.brier_global,
+    },
+    {
+      label: 'Value interval, held out',
+      detail: `p10–p90 interval covers ${Math.round(fit.interval.held_out.coverage * fit.interval.held_out.n_test)} of ${fit.interval.held_out.n_test} held-out tokens (${(fit.interval.held_out.coverage * 100).toFixed(1)}%)`,
+      passed: fit.interval.held_out.coverage >= 0.6 && fit.interval.held_out.coverage <= 1,
+    },
+    {
+      label: 'Farm verdict',
+      detail: `every row's prediction-interval low-end EV clears its farm cost by at least ${minMargin.toLocaleString('en-US')}× — FARM on all ${ranked.length} rows`,
+      passed: minMargin > 1,
+    },
+  ];
   return {
     as_of: s.as_of,
     model_version: MODEL_VERSION,
@@ -792,10 +1027,12 @@ export function buildBoard(s: Snapshot): Board {
       live_total: s.protocols.filter((p) => !isPreToken(p)).length,
       live_shown: live.length,
       census,
+      min_pred_interval_margin: minMargin,
     },
     rows: ranked,
     unranked,
     live,
+    checks,
   };
 }
 
@@ -831,5 +1068,6 @@ export function boardIssue(b: Board, watchlist: string[]): string | null {
   }
   const slugs = new Set(b.rows.map((r) => r.slug));
   for (const w of watchlist) if (!slugs.has(w)) return `watchlist slug ${w} is missing from the board`;
+  for (const c of b.checks) if (!c.passed) return `build check failed: ${c.label} — ${c.detail}`;
   return null;
 }

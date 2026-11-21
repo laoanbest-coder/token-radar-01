@@ -1,4 +1,4 @@
-// radar-2 entrypoint: build the token launch radar from the snapshot.
+// radar-4 entrypoint: build the token launch radar from the snapshot.
 //   node main.ts [--input path] [--output dir]
 //   MAKEFUN_OUTPUT_DIR overrides the output directory (default /output).
 // Reads the snapshot, fits the launch model, writes board.json, data.js, copies
@@ -95,7 +95,11 @@ function main(): void {
   console.log(`board: ${board.rows.length} ranked rows, ${board.meta.watchlist_ranked}/${board.meta.watchlist_total} watchlist covered`);
   console.log(`census: ${board.meta.protocols_total} accounted (${board.meta.census.ranked} ranked, ${board.meta.census.live_token ?? 0} live, ${board.unranked.length - (board.meta.census.live_token ?? 0)} pre-token excluded)`);
   console.log(`model: ridge lambda ${board.model.lambda}, ${board.model.comps_used} comps, LOO R2 ${board.model.loo.r2.toFixed(3)}, held-out R2 ${board.model.held_out.r2.toFixed(3)}, time-splits ${board.model.time_splits.map((t) => t.r2.toFixed(2)).join('/')}`);
+  console.log(`odds: held-out Brier ${board.odds_model.held_out.brier.toFixed(4)} vs global ${board.odds_model.held_out.brier_global.toFixed(4)}, log-loss ${board.odds_model.held_out.log_loss.toFixed(4)} vs ${board.odds_model.held_out.log_loss_global.toFixed(4)} (n=${board.odds_model.held_out.n_test})`);
+  console.log(`interval: p10-p90 x${board.model.interval.factor}, LOO coverage ${board.model.interval.loo_coverage.toFixed(3)}, held-out coverage ${board.model.interval.held_out.coverage.toFixed(3)} (n=${board.model.interval.held_out.n_test})`);
   console.log(`bootstrap: ${board.model.bootstrap.resamples} refits, median rank band ${board.model.bootstrap.median_band_width}, max ${board.model.bootstrap.max_band_width}`);
+  console.log(`farm: min prediction-interval low-end margin ${board.meta.min_pred_interval_margin}x — FARM on all ${board.rows.length} rows`);
+  console.log(`checks: ${board.checks.filter((c) => c.passed).length}/${board.checks.length} build checks passed`);
   console.log(`top EV: ${board.rows[0].name} $${board.rows[0].implied_value_usd.toLocaleString('en-US')}`);
   console.log(`screenshots: ${shots.length}, dossier: ${dossier.length} bytes`);
   console.log(`wrote ${outDir}`);

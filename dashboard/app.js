@@ -29,8 +29,28 @@ $('lede').innerHTML =
   `(${money(topRow.fitted_fdv_usd)} fitted launch value × ${(topRow.token_odds * 100).toFixed(0)}% token odds). ` +
   `The fit explains little of the FDV/TVL spread (leave-one-out R² ${m.loo.r2.toFixed(2)}, median error ×${Math.exp(m.loo.median_abs_log_error).toFixed(1)}), ` +
   `so every value below carries that uncertainty — read the Model &amp; method tab before trusting a row. ` +
-  `The ranks themselves are stable: over 200 bootstrap refits the median rank band is ${m.bootstrap.median_band_width} places wide. ` +
+  `The ranks themselves are stable: over 200 bootstrap refits the median rank band is ${m.bootstrap.median_band_width} places wide, ` +
+  `and the walk-forward test holds up on the newest protocols (R² ${m.time_splits.map((t) => t.r2.toFixed(2)).join(' / ')}). ` +
   `Farm costs ($50–$250 capital plus gas) are small next to every row's expected value; the binding question is the fitted value and the odds, not the cost.`;
+
+// ---------- KPI strip: the headline numbers, on the board tab
+const oh = D.odds_model.held_out;
+const iv = m.interval;
+$('kpi').innerHTML = [
+  [`${D.meta.protocols_total}`, 'protocols scanned'],
+  [`${D.meta.rankable_total}`, `ranked · ${D.meta.watchlist_ranked}/${D.meta.watchlist_total} watchlist`],
+  [`${m.loo.r2.toFixed(2)}`, `leave-one-out R² · median error ×${Math.exp(m.loo.median_abs_log_error).toFixed(1)}`],
+  [m.time_splits.map((t) => t.r2.toFixed(2)).join(' / '), 'walk-forward R² (2023+ / 2024+ / 2025+)'],
+  [`${oh.brier.toFixed(3)} vs ${oh.brier_global.toFixed(3)}`, `token odds, held-out Brier vs global rate (n=${oh.n_test})`],
+  [`${Math.round(iv.held_out.coverage * iv.held_out.n_test)}/${iv.held_out.n_test}`, `held-out tokens inside the p10–p90 value interval (×${iv.factor})`],
+  [`≥${Math.round(D.meta.min_pred_interval_margin).toLocaleString('en-US')}×`, 'lowest low-end EV ÷ farm cost — FARM on every row'],
+].map(([b, s]) => `<div><b>${b}</b><span>${esc(s)}</span></div>`).join('');
+
+// ---------- integrity strip: the seven build-time checks, each able to fail the build
+$('integrity').innerHTML =
+  `<b>Integrity — ${D.checks.filter((c) => c.passed).length} of ${D.checks.length} build checks passed. Any failed check stops the build:</b><ul>` +
+  D.checks.map((c) => `<li class="${c.passed ? '' : 'fail'}">${c.passed ? '✓' : '✗'} <b>${esc(c.label)}</b> — ${esc(c.detail)}</li>`).join('') +
+  `</ul>`;
 
 // ---------- filter controls
 const cats = [...new Set(D.rows.map((r) => r.category).filter(Boolean))].sort();
@@ -153,7 +173,7 @@ function benchTimeSplitRows() {
 $('model').innerHTML = `
 <p>The launch value is fitted, not assumed. The target is <b>log(market cap / TVL)</b> over the
 ${m.comps_used} traded-token protocols in the snapshot with a positive market cap and TVL (of
-${m.comps_total} protocols that record a token at all; one ticker was listed twice — beefy and bifi both
+${m.comps_total} protocols that record a token at all; ${m.comps_total - m.comps_used - m.comps_dedup_dropped.length} record a market cap of zero or less and are excluded by the positivity test, and one ticker was listed twice — beefy and bifi both
 record BIFI — so the smaller row, ${esc(m.comps_dedup_dropped.join(', ') || 'none')}, is dropped and the larger is kept).
 The target is winsorised to [${m.target_winsor.join(', ')}] so one legacy protocol with a tiny TVL and a huge
 market cap cannot drag the fit. The model is a ridge regression (λ = ${m.lambda}) on <b>log TVL alone</b>.
@@ -184,10 +204,32 @@ across those refits: the median band is ${m.bootstrap.median_band_width} places 
 ${m.bootstrap.max_band_width}. The top of the board is stable — the first six rows never leave their rank in any refit —
 while the middle of the board moves by a few places. A narrow band means the rank is stable under refitting; it does not
 mean the fitted value is precise (median error ×${Math.exp(m.loo.median_abs_log_error).toFixed(1)}).</p>
+<h3>Value interval (p10–p90)</h3>
+<p>A fitted value is not a prediction with a point: the honest range around it comes from the
+leave-one-out residuals. The p10–p90 interval is the fitted value ÷${m.interval.factor} to ×${m.interval.factor}
+(±${m.interval.half_width_log.toFixed(2)} in log terms). It covers ${(m.interval.loo_coverage * 100).toFixed(1)}% of the
+${m.interval.loo_n} traded comps leave-one-out, and ${Math.round(m.interval.held_out.coverage * m.interval.held_out.n_test)} of the
+${m.interval.held_out.n_test} held-out tokens (${(m.interval.held_out.coverage * 100).toFixed(1)}%) — the width for that check was refit on the
+training comps only, so the held-out tokens are genuinely unseen. The interval is wide because the residuals are wide:
+the median traded token sits ×${Math.exp(m.loo.median_abs_log_error).toFixed(1)} from its fitted value. Every row's
+expected value at the <i>bottom</i> of its interval still clears its farm cost by at least
+${Math.round(D.meta.min_pred_interval_margin).toLocaleString('en-US')}× — that is why the farm verdict is FARM on all
+${D.rows.length} rows, and why the binding question is the fitted value, not the cost.</p>
 <h3>Token odds</h3>
 <p>Odds are fitted from the snapshot itself: the share of protocols that record a token, by age band and by
 category, each shrunk toward the global rate of ${(m && D.odds_model.global_rate * 100).toFixed(1)}% with a
 prior of ${D.odds_model.shrink_prior}. Age bands: ${D.odds_model.age_bands.map((b) => `${b.lo}–${b.hi >= 100000 ? '∞' : b.hi}d: ${(b.shrunk * 100).toFixed(0)}% (n=${b.n})`).join(', ')}. The two shrunk rates are averaged and clamped to 5–90%.</p>
+<h3>Token odds, held out</h3>
+<p>The odds were tested the same way as the value model: refit on 80% of the protocols (slug hash not 0 mod 5)
+and scored on the other ${D.odds_model.held_out.n_test}. Brier score ${D.odds_model.held_out.brier.toFixed(4)} against
+${D.odds_model.held_out.brier_global.toFixed(4)} for just guessing the global rate, and log-loss
+${D.odds_model.held_out.log_loss.toFixed(4)} against ${D.odds_model.held_out.log_loss_global.toFixed(4)} — the
+age-and-category odds beat the global rate on both. The calibration table shows where they are still off: they
+over-predict for protocols aged 1–2 years and under-predict for the oldest protocols and for protocols with no
+listing date, on this one held-out split.</p>
+<table><thead><tr><th>Age band</th><th>n</th><th>Mean predicted odds</th><th>Actual token rate</th></tr></thead><tbody>
+${D.odds_model.held_out.calibration.map((c) => `<tr><td>${esc(c.band)}</td><td class="num">${c.n}</td><td class="num">${(c.pred * 100).toFixed(1)}%</td><td class="num">${(c.actual * 100).toFixed(1)}%</td></tr>`).join('')}
+</tbody></table>
 <h3>Farm costs</h3>
 <p>Capital by TVL tier: &lt;$50M → $50, &lt;$250M → $100, &lt;$1B → $150, else $250. Gas per transaction is a
 stated typical for November 2026 (Ethereum $8.00, Arbitrum $0.15, Base $0.08, Solana $0.01, and so on — see
@@ -225,23 +267,31 @@ function openDetail(slug) {
     ['Intercept', c.intercept],
     ['Size (log₁₀ TVL)', c.log10_tvl],
   ].map(([k, v]) => `<tr><td>${k}</td><td class="num">${v.toFixed(3)}</td></tr>`).join('');
+  const iv = m.interval;
+  const lowEv = (r.fitted_fdv_usd / iv.factor) * r.token_odds;
+  const lowMargin = lowEv / r.farm.total_cost_usd;
   $('detailBody').innerHTML = `
     <h2>${r.is_watchlist ? '★ ' : ''}${esc(r.name)}</h2>
     <p>${esc(r.category ?? 'Uncategorised')} · ${esc(r.chains.join(', '))} · TVL ${money(r.tvl_usd)} · 7d ${pct(r.change_7d)} · age ${age(r.age_days)} · ${r.is_watchlist ? 'on the watchlist' : 'below the watchlist floor'}</p>
     <h3>Expected value</h3>
     <table><tbody>
       <tr><td>Fitted launch value (TVL × fitted ratio ${r.fitted_ratio})</td><td class="num">${money(r.fitted_fdv_usd)}</td></tr>
+      <tr><td>Fitted launch value, p10–p90 over 200 bootstrap refits</td><td class="num">${money(r.fitted_fdv_p10)} – ${money(r.fitted_fdv_p90)}</td></tr>
       <tr><td>Token odds</td><td class="num">${(r.token_odds * 100).toFixed(1)}%</td></tr>
       <tr><td><b>Expected value</b></td><td class="num"><b>${money(r.implied_value_usd)}</b></td></tr>
+      <tr><td>Expected value, p10–p90 (bootstrap fitted-value band × odds)</td><td class="num">${money(r.fitted_fdv_p10 * r.token_odds)} – ${money(r.fitted_fdv_p90 * r.token_odds)}</td></tr>
+      <tr><td>Prediction interval, p10–p90 (fitted ÷${iv.factor} to ×${iv.factor})</td><td class="num">${money(r.fitted_fdv_usd / iv.factor)} – ${money(r.fitted_fdv_usd * iv.factor)}</td></tr>
       <tr><td>Bootstrap rank band (p10–p90 over 200 refits)</td><td class="num">${r.bootstrap_rank_p10 === r.bootstrap_rank_p90 ? 'rank ' + r.bootstrap_rank_p10 + ' in every refit' : 'ranks ' + r.bootstrap_rank_p10 + '–' + r.bootstrap_rank_p90}</td></tr>
       <tr><td>Farm cost (capital ${money(r.farm.capital_usd)} + gas ${money(r.farm.gas_usd)})</td><td class="num">${money(r.farm.total_cost_usd)}</td></tr>
       <tr><td>Net expected value</td><td class="num ${r.farm.net_ev_usd >= 0 ? 'pos' : 'neg'}">${money(r.farm.net_ev_usd)}</td></tr>
       <tr><td>Break-even launch value</td><td class="num">${money(r.farm.break_even_fdv_usd)}</td></tr>
       <tr><td>Active hours / expected value per hour</td><td class="num">${r.farm.active_hours}h · ${money(r.farm.ev_per_hour_usd)}/h</td></tr>
+      <tr><td>Low-end check: expected value at the bottom of the prediction interval ÷ farm cost</td><td class="num">${lowMargin >= 100 ? Math.round(lowMargin).toLocaleString('en-US') + '×' : lowMargin.toFixed(1) + '×'}</td></tr>
     </tbody></table>
     <h3>Model breakdown (log ratio ${r.model_log_ratio})</h3>
     <table><tbody>${contribRows}</tbody></table>
-    <h3>Farm plan</h3>
+    <h3>Farm plan — ${r.farm.hold_days} days, ${r.farm.start_date} to ${r.farm.end_date}</h3>
+    <p>Starts ${r.farm.start_date} (the snapshot date). Weekly claims on ${r.farm.claim_dates.join(', ')}. Unwinds ${r.farm.end_date}.</p>
     <ol class="steps">${r.farm_steps.map((s) => `<li>${esc(s)}</li>`).join('')}</ol>
     <p class="warn">This is a plan for genuine use of a real protocol, not a promise of an airdrop. The snapshot records no token for this protocol; it does not say the protocol will ever issue one.</p>`;
   $('detail').showModal();
