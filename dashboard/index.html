@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Token Launch Radar — 14 November 2026</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>Token Launch Radar</h1>
+  <p class="sub">Which pre-token protocols are worth farming, and what would a launch be worth?</p>
+  <p class="facts" id="facts"></p>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button data-tab="board" class="active" role="tab">Board</button>
+  <button data-tab="live" role="tab">Live tokens</button>
+  <button data-tab="model" role="tab">Model &amp; method</button>
+</nav>
+
+<section id="tab-board">
+  <div class="lede" id="lede"></div>
+  <div class="controls">
+    <label>Search <input id="q" type="search" placeholder="name or slug" autocomplete="off"></label>
+    <label>Category <select id="category"><option value="">All categories</option></select></label>
+    <label>Chain <select id="chain"><option value="">All chains</option></select></label>
+    <label class="check"><input id="watchlist" type="checkbox"> Watchlist only</label>
+    <label>Sort <select id="sort">
+      <option value="rank">Expected value (rank)</option>
+      <option value="fitted">Fitted launch value</option>
+      <option value="odds">Token odds</option>
+      <option value="tvl">TVL</option>
+      <option value="netev">Net expected value</option>
+      <option value="perhour">Expected value per hour</option>
+    </select></label>
+  </div>
+  <p class="count" id="count"></p>
+  <div class="tablewrap"><table id="board">
+    <thead><tr>
+      <th>#</th><th>Protocol</th><th>Category</th><th>Chains</th><th>TVL</th><th>7d</th>
+      <th>Age</th><th>Fitted launch value</th><th>Token odds</th><th>Expected value</th>
+      <th>Farm cost</th><th>Net EV</th><th>$/hour</th><th></th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <p class="note">Expected value = token odds × fitted launch value. Farm cost = capital + gas. Net EV subtracts the farm cost. A protocol “records no token” in the snapshot; that is not a claim it has none.</p>
+</section>
+
+<section id="tab-live" hidden>
+  <p class="lede">Live tokens are shown separately: they already trade, so they are not ranked for a launch. The top 100 by market cap are listed, with the FDV/TVL ratio the launch model was fitted on.</p>
+  <div class="tablewrap"><table id="live">
+    <thead><tr><th>#</th><th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th><th>FDV/TVL</th><th>Age</th></tr></thead>
+    <tbody id="liveRows"></tbody>
+  </table></div>
+</section>
+
+<section id="tab-model" hidden>
+  <h2>How the numbers are made</h2>
+  <div id="model"></div>
+  <h3>Try it yourself</h3>
+  <p>Move the sliders to see how the board changes. The growth weight scales the 7-day growth term; the category weight blends the category effect toward zero. The base fit is the one reported above.</p>
+  <div class="sandbox">
+    <label>Growth weight <input id="wGrowth" type="range" min="0" max="2" step="0.1" value="1"> <span id="wGrowthVal">1.0×</span></label>
+    <label>Category weight <input id="wCat" type="range" min="0" max="1" step="0.1" value="1"> <span id="wCatVal">1.0×</span></label>
+  </div>
+  <p class="count" id="sandboxNote"></p>
+  <h3>What the model cannot see</h3>
+  <ul>
+    <li>The snapshot is one day, 14 November 2026. A protocol can launch, be acquired, or wind down the next day.</li>
+    <li>FDV/TVL among traded tokens is wildly dispersed (10th percentile 0.013, 90th percentile 2.9). The fit explains only a small part of it — see the validation numbers above.</li>
+    <li>Token odds come from how often protocols of the same age and category have a token in this snapshot. They say nothing about points programs, team statements, or airdrop plans, which the snapshot does not carry.</li>
+    <li>Gas costs are stated typicals for November 2026, not quotes. Farm plans assume the wallet already holds stablecoins.</li>
+    <li>Expected value is not a promise: every row's expected value clears its farm cost by a wide margin, because fitted launch values are in the millions and farm capital is $50–$250. The binding uncertainty is the fitted value itself (median error ×3.5) and the token odds — not the cost.</li>
+  </ul>
+</section>
+
+<dialog id="detail"><div id="detailBody"></div><button id="closeDetail">Close</button></dialog>
+
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
