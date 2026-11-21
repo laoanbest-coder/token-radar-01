@@ -58,7 +58,7 @@ Pure functions of the snapshot only: no clock, no randomness, no network. Ties b
 ## What remains / known limits
 
 - The 3 screenshots are taken from the built dashboard; the dashboard must be served from the output directory (data.js sits beside dashboard/) for the screenshots to match the code.
-- Screenshots ship in the repo as single-line base64 (`screenshots/*.png.b64`) because the GitHub push path cannot carry binary files; `main.ts` decodes them into the output's `screenshots/` as PNGs at runtime (pure decode, byte-identical to the originals — verified by sha256 after the change, dossier unchanged at 857,208 bytes).
+- Screenshots ship in the repo as single-line base64 (`screenshots/*.png.b64`) because the GitHub push path cannot carry binary files; `main.ts` decodes them into the output's `screenshots/` as PNGs at runtime (pure decode, byte-identical to the originals — verified by sha256 after the change). Re-shot 2026-11-21 at 1440×900 viewport (all three 1440×900, each under 512 KiB, per the site's screenshot gate); dossier 893,712 bytes.
 - The model is deliberately simple: with 128 comps and a target this noisy, a heavier model (interactions, more categories) overfits — the leave-one-out numbers above are the evidence.
 - The snapshot is one day. A protocol can launch, be acquired or wind down the next day; the board does not update itself.
 - Farm costs are small next to the expected values: capital is $50–$250 plus a few dollars of gas, while every row's fitted launch value is in the millions, so every row clears its own farm cost by a wide margin. The binding uncertainty is the fitted value itself (median error ×3.5) and the token odds — not the cost.
